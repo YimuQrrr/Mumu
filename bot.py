@@ -11,13 +11,39 @@ import json
 import re
 import os
 
+
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key, value)
+
+
+load_env_file()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_IMAGE_API_KEY = os.getenv("OPENROUTER_IMAGE_API_KEY")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 
 def openrouter_headers():
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not set")
     return {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+
+
+def openrouter_image_headers():
+    if not OPENROUTER_IMAGE_API_KEY:
+        raise RuntimeError("OPENROUTER_IMAGE_API_KEY is not set")
+    return {"Authorization": f"Bearer {OPENROUTER_IMAGE_API_KEY}"}
 
 
 # 设置 intents 初始化
@@ -991,7 +1017,7 @@ async def image_to_text(image_url):
     async with aiohttp.ClientSession() as session:
         async with session.post(
             url="https://openrouter.ai/api/v1/chat/completions",
-            headers=openrouter_headers(),
+            headers=openrouter_image_headers(),
             json={
                 "model": "perceptron/perceptron-mk1",
                 "messages": [{
@@ -1087,6 +1113,4 @@ async def send_leave(message):
 
 
 
-with open('TK.txt', 'r') as file:   #Discord Token
-    TOKEN = file.read().strip()
-client.run(TOKEN)
+client.run(DISCORD_TOKEN)
