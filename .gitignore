@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.env
+TK.txt
+messages.txt
+group_chat.txt
+mumu_memory.txt
