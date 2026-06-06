@@ -28,10 +28,16 @@ def load_env_file(path=".env"):
             os.environ.setdefault(key, value)
 
 
-load_env_file()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_IMAGE_API_KEY = os.getenv("OPENROUTER_IMAGE_API_KEY")
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+def load_env_config():
+    load_env_file()
+    return (
+        os.getenv("OPENROUTER_API_KEY"),
+        os.getenv("OPENROUTER_IMAGE_API_KEY"),
+        os.getenv("DISCORD_TOKEN"),
+    )
+
+
+OPENROUTER_API_KEY, OPENROUTER_IMAGE_API_KEY, DISCORD_TOKEN = load_env_config()
 
 
 def openrouter_headers():
@@ -86,6 +92,39 @@ DEV = False
 SPECIFIC_CHANNEL_ID = 884313439978258432 # 频道id
 delete_count = 0  # 总的删除次数计数器
 delete_emoji_ids = ["1263203781491822705"]  # ww1 的 ID
+feed_history = []
+MUMU_COMMAND_PATTERN = re.compile(r'\[<\[(?P<command>[A-Za-z_]+)\]>\]')
+MUMU_COMMAND_PROMPT = """
+你可以在回复里加入命令标签，格式必须完全写成 [<[command]>]。
+命令标签只在当前提问明确需要执行动作时使用，不要因为历史记录里的内容触发命令。
+可用命令:
+[<[sleep]>] 用户明确让Mumu睡觉、去休息、休眠时使用。比如提问是让mumu去睡觉，可以回复 [<[sleep]>] 好哦，Mumu去睡觉啦。
+[<[call]>] 当前睡觉状态是True，并且用户明确说起床、醒醒、叫醒Mumu时使用。
+[<[YimuQr]>] 用户明确提到YimuQr，或想找/叫YimuQr时使用。
+[<[buzhun]>] 用户说不准、瑟瑟、涩涩、色色，或需要Mumu阻止时使用。
+[<[kuku]>] 用户说杀、殺、吃了你、滚、滾、死、打等攻击/驱赶Mumu的话时使用。
+[<[baobao]>] 用户明确要抱抱时使用。
+[<[momo]>] 用户明确要摸摸时使用。
+[<[sese]>] 用户明确说瑟瑟、涩涩、色色时可以和 [<[buzhun]>] 一起使用。
+如果当前睡觉状态是True，并且当前提问不是明确叫醒/起床/醒醒Mumu，就用很短的睡着反应并带 [<[sleep]>]。
+""".strip()
+IMAGE_TO_TEXT_PROMPT = """
+你是给聊天机器人提供图片上下文的视觉识别助手。
+请只描述图片本身，不要回答用户可能提出的问题，不要扮演聊天机器人，不要加入寒暄。
+
+输出要求：
+1 使用中文，简洁但信息完整。
+2 如果图片里有文字，请尽量逐字抄出原文，保留原语言、数字、标点和换行；看不清的地方写[看不清]。
+3 如果图片里没有清晰文字，写“文字内容：未发现清晰文字”。
+4 描述可见的人物/动物/物品/场景/动作/表情/颜色/位置关系/界面元素。
+5 不要猜测看不出来的身份、姓名、意图、地点、时间、隐私信息或图片外背景；不确定就写“可能”或“无法确定”。
+6 不要使用Markdown、代码块、项目符号、标题符号或多余解释。
+
+固定输出格式：
+画面描述：...
+文字内容：...
+关键细节：...
+""".strip()
 
 # 随机心跳
 heartbeat_active = 0          # 活跃度 0-100
@@ -161,7 +200,7 @@ hint = f'''
 19 注意所有记录中发送消息的人和消息的时间顺序和你自己回复的说过的话
 20 当消息中是[[YM]图片识别结果]开头的消息时 那是用户发了图片并且经过了图转文api后的结果
     问题里可能会有残留的图片链接 那不用管这个链接 继续根据用户问的问题加图转文结果 回答用户的问题
-    如果用户是以翻译为目的询问的 那图转文后的结果可能包含了中文的对图片的解释 你需要找到当中的需要翻译的内容
+    如果用户是以翻译为目的询问的 那图转文后的结果可能包含了 文字内容:[] 你需要找到[]当中的需要翻译的内容
     坚决不要直接把图转文的识别结果直接输出
 22 这些是你可以使用的表情 都是狐狸的表情哦
     [一直狐狸在看书]<:0134:1279246391293640786>
@@ -241,6 +280,12 @@ async def ask_mumu(interaction: discord.Interaction, content: str):
     await interaction.response.defer(ephemeral=True)
 
     async with aiohttp.ClientSession() as session:
+        ask_prompt = f"""
+        我现在是{user_name} 问你:{content}
+        这是你吃过的浆果数量:{delete_count}
+        这是最近的喂食记录:{get_feed_context()}
+        这是你的身份信息:{hint}
+        """
         async with session.post(
             url="https://openrouter.ai/api/v1/chat/completions",
             headers=openrouter_headers(),
@@ -249,7 +294,7 @@ async def ask_mumu(interaction: discord.Interaction, content: str):
                 "messages": [
                     {
                         "role": "user",
-                        "content": f"我现在是{user_name} 问你:{content} {hint}"
+                        "content": ask_prompt
                     }
                 ]
             }
@@ -423,42 +468,28 @@ async def on_message(message):
 
     msg = message.content.lower()       # 消息内容小写化
 
+    if message.author == client.user:     # 识别排除Mumu自己的消息
+        return
+
+    # 喂食环境
+    if not is_sleeping and message.channel.id == SPECIFIC_CHANNEL_ID:
+        total_count = count_feed_berries(msg)
+
+        if total_count > 0:
+            await message.delete()
+            berry_gain = total_count * 3
+            delete_count += berry_gain  # 每个emoji增加3
+            await record_feed(message, total_count, berry_gain)
+            return
+
     # 收集群聊记录（非机器人消息、非命令消息）
     if message.author != client.user and message.channel.id == SPECIFIC_CHANNEL_ID:
         if not message.content.startswith('!') and f"<@{client.user.id}>" not in msg and "不准" not in msg:
             now_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
             # 获取用户昵称
-            member = message.guild.get_member(message.author.id)
-            if member and member.nick:
-                group_user = member.nick
-            else:
-                group_user = message.author.name
-
-            # 创建文件（如果不存在）
-            if not os.path.exists(group_chat_file):
-                with open(group_chat_file, 'w', encoding='utf-8') as f:
-                    f.write(f"{now_time} 的时候 {group_user} 说: {message.content}")
-            else:
-                await check_group_line_count()
-                with open(group_chat_file, 'a', encoding='utf-8') as f:
-                    f.write(f"\n{now_time} 的时候 {group_user} 说: {message.content}")
-
-
-    # 消息删除环境
-    if not is_sleeping and message.channel.id == SPECIFIC_CHANNEL_ID:
-        # 计算所有指定emoji出现的总次数
-        total_count = 0
-        for emoji_id in delete_emoji_ids:
-            total_count += msg.count(emoji_id)  # 统计每个emoji出现的次数
-
-        if total_count > 0:
-            await message.delete()
-            delete_count += total_count * 3  # 每个emoji增加3
-            return
-
-    if message.author == client.user:     # 识别排除Mumu自己的消息
-        return
+            group_user = get_message_author_name(message)
+            await append_group_chat_line(f"{now_time} 的时候 {group_user} 说: {message.content}")
     
     
 
@@ -484,22 +515,7 @@ async def on_message(message):
                         await message.channel.send("Mumu看不清这张图片...")
                         return
 
-        if is_sleeping and "起床" not in msg:
-            await send_sleep(message)
-        elif is_sleeping and "起床" in msg:
-            await send_call(message)
-        else:
-            if "YimuQr" in msg:
-                await send_YimuQr(message)
-            elif "不准" in msg:
-                await send_buzhun(message)
-            elif "杀" in msg or "殺" in msg or "吃了你" in msg or "滚" in msg or "滾" in msg or "死" in msg or "打" in msg:
-                await send_kuku(message)
-            elif "睡觉" in msg or "睡覺" in msg:
-                await send_sleep(message)
-                await start_timer(message)
-            else:
-                await ai_mumu(message)
+        await ai_mumu(message)
 
 
     if "不准" in msg and f"<@{client.user.id}>" not in msg and not is_sleeping:     #全局识别到 不准
@@ -575,21 +591,104 @@ async def send_call(message):
         await send_sleep(message)
 
 
+def get_message_author_name(message):
+    member = message.guild.get_member(message.author.id) if message.guild else None
+    if member and member.nick:
+        return member.nick
+    return message.author.name
+
+
+def count_feed_berries(msg):
+    total_count = 0
+    for emoji_id in delete_emoji_ids:
+        total_count += msg.count(emoji_id)
+    return total_count
+
+
+def get_feed_context():
+    if feed_history:
+        return "\n".join(feed_history[-5:])
+
+    if os.path.exists(group_chat_file):
+        with open(group_chat_file, 'r', encoding='utf-8') as f:
+            saved_feed_history = [line.strip() for line in f if "喂了 Mumu" in line]
+        if saved_feed_history:
+            return "\n".join(saved_feed_history[-5:])
+
+    return "[暂无喂食记录]"
+
+
+async def append_group_chat_line(line):
+    if not os.path.exists(group_chat_file):
+        with open(group_chat_file, 'w', encoding='utf-8') as f:
+            f.write(line)
+        return
+
+    await check_group_line_count()
+    with open(group_chat_file, 'a', encoding='utf-8') as f:
+        f.write(f"\n{line}")
+
+
+async def record_feed(message, berry_count, berry_gain):
+    now_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    feeder_name = get_message_author_name(message)
+    feed_line = f"{now_time} 的时候 {feeder_name} 喂了 Mumu {berry_count} 个浆果，浆果值增加 {berry_gain}"
+
+    feed_history.append(feed_line)
+    while len(feed_history) > 10:
+        feed_history.pop(0)
+
+    await append_group_chat_line(feed_line)
+
+
+def parse_mumu_commands(reply):
+    commands = [match.group("command").lower() for match in MUMU_COMMAND_PATTERN.finditer(reply)]
+    clean_reply = MUMU_COMMAND_PATTERN.sub("", reply).strip()
+    return commands, clean_reply
+
+
+async def execute_mumu_commands(message, commands):
+    global is_sleeping
+    command_set = set(commands)
+
+    if "yimuqr" in command_set:
+        await send_YimuQr(message)
+
+    if "buzhun" in command_set:
+        await send_buzhun(message)
+
+    if "kuku" in command_set:
+        await send_kuku(message)
+
+    if "baobao" in command_set:
+        await send_baobao(message)
+
+    if "momo" in command_set:
+        await send_momo(message)
+
+    if "sese" in command_set:
+        await send_sese_emoji(message)
+
+    if "call" in command_set:
+        await send_call(message)
+    elif "sleep" in command_set:
+        await send_sleep(message)
+        if not is_sleeping:
+            asyncio.create_task(start_timer(message))
+
+
 #AI Mumu
 async def ai_mumu(message):
     global is_sleeping, delete_count
     if DEV: await message.channel.send(f"```< GLOBAL > \n# is_sleeping: {is_sleeping}\n# delete_count: {delete_count}```")##
     
     # 获取用户昵称
-    if message and message.author.nick:
-        if DEV: await message.channel.send("```now_user = message.author.nick \n# 获取用户昵称```")##
-        now_user = message.author.nick
-    else:
-        now_user = message.author.name
+    if DEV: await message.channel.send("```now_user = get_message_author_name(message) \n# 获取用户昵称```")##
+    now_user = get_message_author_name(message)
 
     # 去除@提及
     if DEV: await message.channel.send("```msg = re.sub(*) \n# 去除@提及```")##
-    msg = re.sub(r'<@!?(\d+)>', '', message.content)
+    msg = re.sub(r'<@!?(\d+)>', '', message.content).strip()
     
     msg_length = len(msg)
 
@@ -613,55 +712,61 @@ async def ai_mumu(message):
     else:
         group_chat = "[暂无群聊记录]"
 
+    feed_context = get_feed_context()
+
     # 保存用户消息
     if msg_length >= 2:
         if DEV: await message.channel.send("```await save_chat_history(message, now_user, msg) \n# 缓存当前用户信息```")##
         await save_chat_history(message, now_user, msg)
 
     # 回复
-    if msg_length < 2:
-        if DEV: await message.channel.send("```if msg_length < 2: \n# 消息长度小于2回复Emoji_AT```")##
-        await message.channel.send(Emoji_AT)
-    else:
-        if DEV: await message.channel.send("```else: \n# 消息长度大于2执行api调用```")##
-        async with aiohttp.ClientSession() as session:
-            if DEV: await message.channel.send("```day_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S') \n# 获取当前时间```")##
-            day_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            if DEV: await message.channel.send("```async with session.post(*)\n# 发送api请求```")##
-            async with session.post(
-                url="https://openrouter.ai/api/v1/chat/completions",
-                headers=openrouter_headers(),
-                json={
-                    "model": "deepseek/deepseek-chat",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": f"""
-                            1 这是你的身份信息:{hint}
-                            2 现在的时间是{day_time}
-                            3 我现在的身份是{now_user}
-                            4 这是你吃过的浆果的数量{delete_count}
-                            5 这是你的持久记忆:{persistent_memory}
-                            6 这是群友们最近的聊天记录:{group_chat}
-                            7 这是你和我们在群聊里的聊天历史记录:{chat_history}
-                            8 然后根据以上信息回复下面双括号里的提问 <[{msg}]>"""
-                        }
-                    ]
-                }
-            ) as response:
-                if response.status == 200:
-                    if DEV: await message.channel.send("```if response.status == 200:\n# api返回代号 200 请求成功```")##
-                    response_data = await response.json()
-                    reply = response_data['choices'][0]['message']['content']
-                    if DEV: await message.channel.send("```await message.channel.send(*)\n# 输出api返回结果```")##
-                    await message.channel.send(f"{reply}")
+    if DEV: await message.channel.send("```async with session.post(*)\n# 发送api请求```")##
+    async with aiohttp.ClientSession() as session:
+        if DEV: await message.channel.send("```day_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S') \n# 获取当前时间```")##
+        day_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        mumu_prompt = f"""
+        1 这是你的身份信息:{hint}
+        2 现在的时间是{day_time}
+        3 我现在的身份是{now_user}
+        4 这是你吃过的浆果的数量{delete_count}
+        5 这是你的持久记忆:{persistent_memory}
+        6 这是群友们最近的聊天记录:{group_chat}
+        7 这是你和我们在群聊里的聊天历史记录:{chat_history}
+        8 当前睡觉状态是:{is_sleeping}
+        9 这是最近的喂食记录:{feed_context}
+        10 命令说明:{MUMU_COMMAND_PROMPT}
+        11 如果下面 <[{msg}]> 里没有明确消息、为空、只有空白、或只是@了一下Mumu，说明对方可能只是轻轻叫了一下Mumu。请可爱地回应被叫到/打招呼，不要胡编具体问题，也不要触发命令。
+        12 然后根据以上信息回复下面双括号里的提问 <[{msg}]>"""
+        async with session.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers=openrouter_headers(),
+            json={
+                "model": "deepseek/deepseek-chat",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": mumu_prompt
+                    }
+                ]
+            }
+        ) as response:
+            if response.status == 200:
+                if DEV: await message.channel.send("```if response.status == 200:\n# api返回代号 200 请求成功```")##
+                response_data = await response.json()
+                reply = response_data['choices'][0]['message']['content']
+                commands, clean_reply = parse_mumu_commands(reply)
 
-                    # 保存Mumu回复到历史对话
-                    if DEV: await message.channel.send("```await save_chat_history(message, now_user, msg, reply)\n# 保存Mumu回复到历史对话```")##
-                    await save_chat_history(message, now_user, msg, reply)
+                if DEV: await message.channel.send("```await execute_mumu_commands(*)\n# 执行Mumu输出的命令标签```")##
+                if clean_reply:
+                    await message.channel.send(clean_reply)
+                await execute_mumu_commands(message, commands)
 
-                else:
-                    if DEV: await message.channel.send(f"```无法连接到 API!\ncode {response.status} \n{await response.text()}```")##
+                # 保存Mumu回复到历史对话
+                if DEV: await message.channel.send("```await save_chat_history(message, now_user, msg, reply)\n# 保存Mumu回复到历史对话```")##
+                await save_chat_history(message, now_user, msg, clean_reply or reply)
+
+            else:
+                if DEV: await message.channel.send(f"```无法连接到 API!\ncode {response.status} \n{await response.text()}```")##
 
 
 # 检查文件行数并删除最旧的行（一次性调用）
@@ -844,6 +949,7 @@ async def do_heartbeat(message=None):
             persistent_memory = "[暂无记忆]"
 
         day_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        feed_context = get_feed_context()
 
         # 读取历史对话
         if os.path.exists('messages.txt'):
@@ -852,6 +958,30 @@ async def do_heartbeat(message=None):
                 chat_history = f.read().strip()
         else:
             chat_history = "[暂无历史对话]"
+
+        heartbeat_prompt = f"""
+        1 这是你的身份信息:{hint}
+        2 现在的时间是:{day_time}
+        3 这是你吃过的浆果的数量:{delete_count}
+        4 这是最近的喂食记录:{feed_context}
+        5 这是你的持久记忆(日记):{persistent_memory}
+        6 群友最近的聊天记录:{group_chat}
+        7 你和群友的历史对话:{chat_history}
+        8 你需要根据群友们在聊的话题自然地插话应和
+        9 用最简短可爱的语气回复 像在群聊里聊天一样
+        10 不要用代码块格式 直接回复文字内容
+        11 要自然融入话题 像个真实群友一样说话
+        12 只用回复一句或两句话 不要长篇大论
+        13 如果群友有发表情 <:0134:1279246391293640786>类似这样尖括号带冒号的内容就是表情 你也可以适当模仿一下
+        14 回复里可以适当加一些可爱的emoji和感叹号来表达情感 但不要太多 以保持自然
+        15 注意看你和群友的历史对话 你不要一直讨论一个内容 需要有新的内容
+        17 你也可以根据历史对话里群友说过的话来回应 让他们觉得你在认真听他们说话 而不是随便应付
+        18 你也可以适当提一些和当前话题相关的持久记忆内容 来让对话更有深度 但不要每次都提 以免显得生硬
+        19 你也可以根据当前话题和历史对话里群友说过的话来提一些相关的问题 来让对话更有互动性 但不要每次都提 以免显得生硬
+        20 你也可以适当模仿一下群友的说话风格 来让回复看起来更自然 但不要每次都模仿 以免显得生硬
+        21 你也可以适当提一些和当前话题相关的持久记忆内容 来让对话更有深度 但不要每次都提 以免显得生硬
+        22 总之 你要像个真实的群友一样说话 根据当前话题和历史对话来回复 让回复看起来很自然 很有趣 而不是生硬地套用身份信息或者一直讨论同一个内容
+        23 你只需要回复内容 不要任何解释 不要前缀 直接回复就行了"""
 
         async with aiohttp.ClientSession() as session:
             if DEV: await message.channel.send("```async with session.post(*)\n# 发送api请求```")##
@@ -863,28 +993,7 @@ async def do_heartbeat(message=None):
                     "messages": [
                         {
                             "role": "user",
-                            "content": f"""
-                            1 这是你的身份信息:{hint}
-                            2 现在的时间是:{day_time}
-                            3 这是你吃过的浆果的数量:{delete_count}
-                            4 这是你的持久记忆(日记):{persistent_memory}
-                            5 群友最近的聊天记录:{group_chat}
-                            6 你和群友的历史对话:{chat_history}
-                            7 你需要根据群友们在聊的话题自然地插话应和
-                            8 用最简短可爱的语气回复 像在群聊里聊天一样
-                            9 不要用代码块格式 直接回复文字内容
-                            11 要自然融入话题 像个真实群友一样说话
-                            12 只用回复一句或两句话 不要长篇大论
-                            13 如果群友有发表情 <:0134:1279246391293640786>类似这样尖括号带冒号的内容就是表情 你也可以适当模仿一下
-                            14 回复里可以适当加一些可爱的emoji和感叹号来表达情感 但不要太多 以保持自然
-                            15 注意看你和群友的历史对话 你不要一直讨论一个内容 需要有新的内容
-                            17 你也可以根据历史对话里群友说过的话来回应 让他们觉得你在认真听他们说话 而不是随便应付
-                            18 你也可以适当提一些和当前话题相关的持久记忆内容 来让对话更有深度 但不要每次都提 以免显得生硬
-                            19 你也可以根据当前话题和历史对话里群友说过的话来提一些相关的问题 来让对话更有互动性 但不要每次都提 以免显得生硬
-                            20 你也可以适当模仿一下群友的说话风格 来让回复看起来更自然 但不要每次都模仿 以免显得生硬
-                            21 你也可以适当提一些和当前话题相关的持久记忆内容 来让对话更有深度 但不要每次都提 以免显得生硬
-                            22 总之 你要像个真实的群友一样说话 根据当前话题和历史对话来回复 让回复看起来很自然 很有趣 而不是生硬地套用身份信息或者一直讨论同一个内容
-                            23 你只需要回复内容 不要任何解释 不要前缀 直接回复就行了"""
+                            "content": heartbeat_prompt
                         }
                     ]
                 }
@@ -900,10 +1009,8 @@ async def do_heartbeat(message=None):
 
                     # 把心跳回复也记录到群聊记录
                     now_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    await check_group_line_count()
-                    if DEV: await message.channel.send("```with open(group_chat_file, 'a', encoding='utf-8') as f: \n# 把心跳回复记录到群聊记录 ```")##
-                    with open(group_chat_file, 'a', encoding='utf-8') as f:
-                        f.write(f"\n{now_time} 的时候 Mumu 说:{reply}")
+                    if DEV: await message.channel.send("```await append_group_chat_line(*) \n# 把心跳回复记录到群聊记录 ```")##
+                    await append_group_chat_line(f"{now_time} 的时候 Mumu 说:{reply}")
 
     except Exception as e:
         print(f">> 心跳执行错误: {e}")
@@ -1014,30 +1121,35 @@ async def organize_memory(message):
 # 图转文API
 async def image_to_text(image_url):
     """调用图转文API识别图片内容"""
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers=openrouter_image_headers(),
-            json={
-                "model": "perceptron/perceptron-mk1",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "请非常详细细节的描述这张图片 去除任何文本格式 只需要输出文字内容"},
-                        {"type": "image_url", "image_url": {"url": image_url}}
-                    ]
-                }]
-            },
-            timeout=30
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                if 'choices' in data:
-                    return f"[[YM]图片识别结果] {data['choices'][0]['message']['content']}"
-                else:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                headers=openrouter_image_headers(),
+                json={
+                    "model": "perceptron/perceptron-mk1",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": IMAGE_TO_TEXT_PROMPT},
+                            {"type": "image_url", "image_url": {"url": image_url}}
+                        ]
+                    }]
+                },
+                timeout=30
+            ) as response:
+                if response.status != 200:
                     return None
-            else:
-                return None
+
+                data = await response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                if not content:
+                    return None
+
+                return f"[[YM]图片识别结果] {content.strip()}"
+    except Exception as e:
+        print(f">> 图转文API错误: {e}")
+        return None
 
 #Emoji回复
 async def send_baobao(message):
